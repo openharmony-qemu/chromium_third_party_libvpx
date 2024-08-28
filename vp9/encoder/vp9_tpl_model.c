@@ -18,10 +18,15 @@
 #include "vp9/common/vp9_reconintra.h"
 #include "vp9/common/vp9_scan.h"
 #include "vp9/encoder/vp9_encoder.h"
+#include "vp9/encoder/vp9_firstpass.h"
+#include "vp9/encoder/vp9_ratectrl.h"
 #include "vp9/encoder/vp9_tpl_model.h"
+#include "vpx/internal/vpx_codec_internal.h"
+#include "vpx/vpx_codec.h"
+#include "vpx/vpx_ext_ratectrl.h"
 
-static void init_gop_frames(VP9_COMP *cpi, GF_PICTURE *gf_picture,
-                            const GF_GROUP *gf_group, int *tpl_group_frames) {
+static int init_gop_frames(VP9_COMP *cpi, GF_PICTURE *gf_picture,
+                           const GF_GROUP *gf_group, int *tpl_group_frames) {
   VP9_COMMON *cm = &cpi->common;
   int frame_idx = 0;
   int i;
@@ -39,9 +44,6 @@ static void init_gop_frames(VP9_COMP *cpi, GF_PICTURE *gf_picture,
 
   memset(recon_frame_index, -1, sizeof(recon_frame_index));
   stack_init(arf_index_stack, MAX_ARF_LAYERS);
-
-  // TODO(jingning): To be used later for gf frame type parsing.
-  (void)gf_group;
 
   for (i = 0; i < FRAME_BUFFERS; ++i) {
     if (frame_bufs[i].ref_count == 0) {
@@ -151,6 +153,8 @@ static void init_gop_frames(VP9_COMP *cpi, GF_PICTURE *gf_picture,
     ++extend_frame_count;
     ++frame_gop_offset;
   }
+
+  return extend_frame_count;
 }
 
 static void init_tpl_stats(VP9_COMP *cpi) {
@@ -161,6 +165,39 @@ static void init_tpl_stats(VP9_COMP *cpi) {
            tpl_frame->height * tpl_frame->width *
                sizeof(*tpl_frame->tpl_stats_ptr));
     tpl_frame->is_valid = 0;
+  }
+}
+
+static void free_tpl_frame_stats_list(VpxTplGopStats *tpl_gop_stats) {
+  int frame_idx;
+  for (frame_idx = 0; frame_idx < tpl_gop_stats->size; ++frame_idx) {
+    vpx_free(tpl_gop_stats->frame_stats_list[frame_idx].block_stats_list);
+  }
+  vpx_free(tpl_gop_stats->frame_stats_list);
+}
+
+static void init_tpl_stats_before_propagation(
+    struct vpx_internal_error_info *error_info, VpxTplGopStats *tpl_gop_stats,
+    TplDepFrame *tpl_stats, int tpl_gop_frames, int frame_width,
+    int frame_height) {
+  int frame_idx;
+  free_tpl_frame_stats_list(tpl_gop_stats);
+  CHECK_MEM_ERROR(
+      error_info, tpl_gop_stats->frame_stats_list,
+      vpx_calloc(tpl_gop_frames, sizeof(*tpl_gop_stats->frame_stats_list)));
+  tpl_gop_stats->size = tpl_gop_frames;
+  for (frame_idx = 0; frame_idx < tpl_gop_frames; ++frame_idx) {
+    const int mi_rows = tpl_stats[frame_idx].height;
+    const int mi_cols = tpl_stats[frame_idx].width;
+    CHECK_MEM_ERROR(
+        error_info, tpl_gop_stats->frame_stats_list[frame_idx].block_stats_list,
+        vpx_calloc(
+            mi_rows * mi_cols,
+            sizeof(
+                *tpl_gop_stats->frame_stats_list[frame_idx].block_stats_list)));
+    tpl_gop_stats->frame_stats_list[frame_idx].num_blocks = mi_rows * mi_cols;
+    tpl_gop_stats->frame_stats_list[frame_idx].frame_width = frame_width;
+    tpl_gop_stats->frame_stats_list[frame_idx].frame_height = frame_height;
   }
 }
 
@@ -355,6 +392,37 @@ static void tpl_model_store(TplDepStats *tpl_stats, int mi_row, int mi_col,
   }
 }
 
+static void tpl_store_before_propagation(VpxTplBlockStats *tpl_block_stats,
+                                         TplDepStats *tpl_stats, int mi_row,
+                                         int mi_col, BLOCK_SIZE bsize,
+                                         int stride, int64_t recon_error,
+                                         int64_t rate_cost, int ref_frame_idx) {
+  const int mi_height = num_8x8_blocks_high_lookup[bsize];
+  const int mi_width = num_8x8_blocks_wide_lookup[bsize];
+  const TplDepStats *src_stats = &tpl_stats[mi_row * stride + mi_col];
+  int idx, idy;
+
+  for (idy = 0; idy < mi_height; ++idy) {
+    for (idx = 0; idx < mi_width; ++idx) {
+      VpxTplBlockStats *tpl_block_stats_ptr =
+          &tpl_block_stats[(mi_row + idy) * stride + mi_col + idx];
+      tpl_block_stats_ptr->row = mi_row * 8;
+      tpl_block_stats_ptr->col = mi_col * 8;
+      tpl_block_stats_ptr->inter_cost = src_stats->inter_cost;
+      tpl_block_stats_ptr->intra_cost = src_stats->intra_cost;
+      // inter/intra_cost here is calculated with SATD which should be close
+      // enough to be used as inter/intra_pred_error
+      tpl_block_stats_ptr->inter_pred_err = src_stats->inter_cost;
+      tpl_block_stats_ptr->intra_pred_err = src_stats->intra_cost;
+      tpl_block_stats_ptr->srcrf_dist = recon_error << TPL_DEP_COST_SCALE_LOG2;
+      tpl_block_stats_ptr->srcrf_rate = rate_cost << TPL_DEP_COST_SCALE_LOG2;
+      tpl_block_stats_ptr->mv_r = src_stats->mv.as_mv.row;
+      tpl_block_stats_ptr->mv_c = src_stats->mv.as_mv.col;
+      tpl_block_stats_ptr->ref_frame_index = ref_frame_idx;
+    }
+  }
+}
+
 static void tpl_model_update_b(TplDepFrame *tpl_frame, TplDepStats *tpl_stats,
                                int mi_row, int mi_col, const BLOCK_SIZE bsize) {
   TplDepFrame *ref_tpl_frame = &tpl_frame[tpl_stats->ref_frame_index];
@@ -430,12 +498,11 @@ static void tpl_model_update(TplDepFrame *tpl_frame, TplDepStats *tpl_stats,
 static void get_quantize_error(MACROBLOCK *x, int plane, tran_low_t *coeff,
                                tran_low_t *qcoeff, tran_low_t *dqcoeff,
                                TX_SIZE tx_size, int64_t *recon_error,
-                               int64_t *sse) {
+                               int64_t *sse, uint16_t *eob) {
   MACROBLOCKD *const xd = &x->e_mbd;
   const struct macroblock_plane *const p = &x->plane[plane];
   const struct macroblockd_plane *const pd = &xd->plane[plane];
   const ScanOrder *const scan_order = &vp9_default_scan_orders[tx_size];
-  uint16_t eob;
   int pix_num = 1 << num_pels_log2_lookup[txsize_to_bsize[tx_size]];
   const int shift = tx_size == TX_32X32 ? 0 : 2;
 
@@ -444,18 +511,15 @@ static void get_quantize_error(MACROBLOCK *x, int plane, tran_low_t *coeff,
 
 #if CONFIG_VP9_HIGHBITDEPTH
   if (xd->cur_buf->flags & YV12_FLAG_HIGHBITDEPTH) {
-    vp9_highbd_quantize_fp_32x32(coeff, pix_num, p->round_fp, p->quant_fp,
-                                 qcoeff, dqcoeff, pd->dequant, &eob,
-                                 scan_order->scan, scan_order->iscan);
+    vp9_highbd_quantize_fp_32x32(coeff, pix_num, p, qcoeff, dqcoeff,
+                                 pd->dequant, eob, scan_order);
   } else {
-    vp9_quantize_fp_32x32(coeff, pix_num, p->round_fp, p->quant_fp, qcoeff,
-                          dqcoeff, pd->dequant, &eob, scan_order->scan,
-                          scan_order->iscan);
+    vp9_quantize_fp_32x32(coeff, pix_num, p, qcoeff, dqcoeff, pd->dequant, eob,
+                          scan_order);
   }
 #else
-  vp9_quantize_fp_32x32(coeff, pix_num, p->round_fp, p->quant_fp, qcoeff,
-                        dqcoeff, pd->dequant, &eob, scan_order->scan,
-                        scan_order->iscan);
+  vp9_quantize_fp_32x32(coeff, pix_num, p, qcoeff, dqcoeff, pd->dequant, eob,
+                        scan_order);
 #endif  // CONFIG_VP9_HIGHBITDEPTH
 
   *recon_error = vp9_block_error(coeff, dqcoeff, pix_num, sse) >> shift;
@@ -498,6 +562,19 @@ static void set_mv_limits(const VP9_COMMON *cm, MACROBLOCK *x, int mi_row,
       ((cm->mi_cols - 1 - mi_col) * MI_SIZE) + (17 - 2 * VP9_INTERP_EXTEND);
 }
 
+static int rate_estimator(const tran_low_t *qcoeff, int eob, TX_SIZE tx_size) {
+  const ScanOrder *const scan_order = &vp9_scan_orders[tx_size][DCT_DCT];
+  int rate_cost = 1;
+  int idx;
+  assert((1 << num_pels_log2_lookup[txsize_to_bsize[tx_size]]) >= eob);
+  for (idx = 0; idx < eob; ++idx) {
+    unsigned int abs_level = abs(qcoeff[scan_order->scan[idx]]);
+    rate_cost += get_msb(abs_level + 1) + 1 + (abs_level > 0);
+  }
+
+  return (rate_cost << VP9_PROB_COST_SHIFT);
+}
+
 static void mode_estimation(VP9_COMP *cpi, MACROBLOCK *x, MACROBLOCKD *xd,
                             struct scale_factors *sf, GF_PICTURE *gf_picture,
                             int frame_idx, TplDepFrame *tpl_frame,
@@ -505,7 +582,8 @@ static void mode_estimation(VP9_COMP *cpi, MACROBLOCK *x, MACROBLOCKD *xd,
                             tran_low_t *qcoeff, tran_low_t *dqcoeff, int mi_row,
                             int mi_col, BLOCK_SIZE bsize, TX_SIZE tx_size,
                             YV12_BUFFER_CONFIG *ref_frame[], uint8_t *predictor,
-                            int64_t *recon_error, int64_t *sse) {
+                            int64_t *recon_error, int64_t *rate_cost,
+                            int64_t *sse, int *ref_frame_idx) {
   VP9_COMMON *cm = &cpi->common;
   ThreadData *td = &cpi->td;
 
@@ -633,11 +711,15 @@ static void mode_estimation(VP9_COMP *cpi, MACROBLOCK *x, MACROBLOCKD *xd,
 #endif
 
     if (inter_cost < best_inter_cost) {
+      uint16_t eob = 0;
       best_rf_idx = rf_idx;
       best_inter_cost = inter_cost;
       best_mv.as_int = mv.as_int;
+      // Since best_inter_cost is initialized as INT64_MAX, recon_error and
+      // rate_cost will be calculated with the best reference frame.
       get_quantize_error(x, 0, coeff, qcoeff, dqcoeff, tx_size, recon_error,
-                         sse);
+                         sse, &eob);
+      *rate_cost = rate_estimator(qcoeff, eob, tx_size);
     }
   }
   best_intra_cost = VPXMAX(best_intra_cost, 1);
@@ -646,8 +728,11 @@ static void mode_estimation(VP9_COMP *cpi, MACROBLOCK *x, MACROBLOCKD *xd,
       1, (best_inter_cost << TPL_DEP_COST_SCALE_LOG2) / (mi_height * mi_width));
   tpl_stats->intra_cost = VPXMAX(
       1, (best_intra_cost << TPL_DEP_COST_SCALE_LOG2) / (mi_height * mi_width));
-  tpl_stats->ref_frame_index = gf_picture[frame_idx].ref_frame[best_rf_idx];
+  if (best_rf_idx >= 0) {
+    tpl_stats->ref_frame_index = gf_picture[frame_idx].ref_frame[best_rf_idx];
+  }
   tpl_stats->mv.as_int = best_mv.as_int;
+  *ref_frame_idx = best_rf_idx;
 }
 
 #if CONFIG_NON_GREEDY_MV
@@ -1062,6 +1147,8 @@ static void build_motion_field(
 static void mc_flow_dispenser(VP9_COMP *cpi, GF_PICTURE *gf_picture,
                               int frame_idx, BLOCK_SIZE bsize) {
   TplDepFrame *tpl_frame = &cpi->tpl_stats[frame_idx];
+  VpxTplFrameStats *tpl_frame_stats_before_propagation =
+      &cpi->tpl_gop_stats.frame_stats_list[frame_idx];
   YV12_BUFFER_CONFIG *this_frame = gf_picture[frame_idx].frame;
   YV12_BUFFER_CONFIG *ref_frame[MAX_INTER_REF_FRAMES] = { NULL, NULL, NULL };
 
@@ -1088,12 +1175,9 @@ static void mc_flow_dispenser(VP9_COMP *cpi, GF_PICTURE *gf_picture,
   const TX_SIZE tx_size = max_txsize_lookup[bsize];
   const int mi_height = num_8x8_blocks_high_lookup[bsize];
   const int mi_width = num_8x8_blocks_wide_lookup[bsize];
-  int64_t recon_error, sse;
-#if CONFIG_NON_GREEDY_MV
-  int square_block_idx;
-  int rf_idx;
-#endif
 
+  tpl_frame_stats_before_propagation->frame_width = cm->width;
+  tpl_frame_stats_before_propagation->frame_height = cm->height;
   // Setup scaling factor
 #if CONFIG_VP9_HIGHBITDEPTH
   vp9_setup_scale_factors_for_frame(
@@ -1133,35 +1217,79 @@ static void mc_flow_dispenser(VP9_COMP *cpi, GF_PICTURE *gf_picture,
   vp9_frame_init_quantizer(cpi);
 
 #if CONFIG_NON_GREEDY_MV
-  for (square_block_idx = 0; square_block_idx < SQUARE_BLOCK_SIZES;
-       ++square_block_idx) {
-    BLOCK_SIZE square_bsize = square_block_idx_to_bsize(square_block_idx);
-    build_motion_field(cpi, frame_idx, ref_frame, square_bsize);
-  }
-  for (rf_idx = 0; rf_idx < MAX_INTER_REF_FRAMES; ++rf_idx) {
-    int ref_frame_idx = gf_picture[frame_idx].ref_frame[rf_idx];
-    if (ref_frame_idx != -1) {
-      MotionField *motion_field = vp9_motion_field_info_get_motion_field(
-          &cpi->motion_field_info, frame_idx, rf_idx, bsize);
-      predict_mv_mode_arr(cpi, x, gf_picture, motion_field, frame_idx,
-                          tpl_frame, rf_idx, bsize);
+  {
+    int square_block_idx;
+    int rf_idx;
+    for (square_block_idx = 0; square_block_idx < SQUARE_BLOCK_SIZES;
+         ++square_block_idx) {
+      BLOCK_SIZE square_bsize = square_block_idx_to_bsize(square_block_idx);
+      build_motion_field(cpi, frame_idx, ref_frame, square_bsize);
+    }
+    for (rf_idx = 0; rf_idx < MAX_INTER_REF_FRAMES; ++rf_idx) {
+      int ref_frame_idx = gf_picture[frame_idx].ref_frame[rf_idx];
+      if (ref_frame_idx != -1) {
+        MotionField *motion_field = vp9_motion_field_info_get_motion_field(
+            &cpi->motion_field_info, frame_idx, rf_idx, bsize);
+        predict_mv_mode_arr(cpi, x, gf_picture, motion_field, frame_idx,
+                            tpl_frame, rf_idx, bsize);
+      }
     }
   }
-#endif
+#endif  // CONFIG_NON_GREEDY_MV
 
   for (mi_row = 0; mi_row < cm->mi_rows; mi_row += mi_height) {
     for (mi_col = 0; mi_col < cm->mi_cols; mi_col += mi_width) {
+      int64_t recon_error = 0;
+      int64_t rate_cost = 0;
+      int64_t sse = 0;
+      // Ref frame index in the ref frame buffer.
+      int ref_frame_idx = -1;
       mode_estimation(cpi, x, xd, &sf, gf_picture, frame_idx, tpl_frame,
                       src_diff, coeff, qcoeff, dqcoeff, mi_row, mi_col, bsize,
-                      tx_size, ref_frame, predictor, &recon_error, &sse);
+                      tx_size, ref_frame, predictor, &recon_error, &rate_cost,
+                      &sse, &ref_frame_idx);
       // Motion flow dependency dispenser.
       tpl_model_store(tpl_frame->tpl_stats_ptr, mi_row, mi_col, bsize,
                       tpl_frame->stride);
+
+      tpl_store_before_propagation(
+          tpl_frame_stats_before_propagation->block_stats_list,
+          tpl_frame->tpl_stats_ptr, mi_row, mi_col, bsize, tpl_frame->stride,
+          recon_error, rate_cost, ref_frame_idx);
 
       tpl_model_update(cpi->tpl_stats, tpl_frame->tpl_stats_ptr, mi_row, mi_col,
                        bsize);
     }
   }
+}
+
+static void trim_tpl_stats(struct vpx_internal_error_info *error_info,
+                           VpxTplGopStats *tpl_gop_stats, int extra_frames) {
+  int i;
+  VpxTplFrameStats *new_frame_stats;
+  const int new_size = tpl_gop_stats->size - extra_frames;
+  if (tpl_gop_stats->size <= extra_frames)
+    vpx_internal_error(
+        error_info, VPX_CODEC_ERROR,
+        "The number of frames in VpxTplGopStats is fewer than expected.");
+  CHECK_MEM_ERROR(error_info, new_frame_stats,
+                  vpx_calloc(new_size, sizeof(*new_frame_stats)));
+  for (i = 0; i < new_size; i++) {
+    VpxTplFrameStats *frame_stats = &tpl_gop_stats->frame_stats_list[i];
+    const int num_blocks = frame_stats->num_blocks;
+    new_frame_stats[i].num_blocks = frame_stats->num_blocks;
+    new_frame_stats[i].frame_width = frame_stats->frame_width;
+    new_frame_stats[i].frame_height = frame_stats->frame_height;
+    new_frame_stats[i].num_blocks = num_blocks;
+    CHECK_MEM_ERROR(
+        error_info, new_frame_stats[i].block_stats_list,
+        vpx_calloc(num_blocks, sizeof(*new_frame_stats[i].block_stats_list)));
+    memcpy(new_frame_stats[i].block_stats_list, frame_stats->block_stats_list,
+           num_blocks * sizeof(*new_frame_stats[i].block_stats_list));
+  }
+  free_tpl_frame_stats_list(tpl_gop_stats);
+  tpl_gop_stats->size = new_size;
+  tpl_gop_stats->frame_stats_list = new_frame_stats;
 }
 
 #if CONFIG_NON_GREEDY_MV
@@ -1265,7 +1393,7 @@ void vp9_init_tpl_buffer(VP9_COMP *cpi) {
 
   vpx_free(cpi->select_mv_arr);
   CHECK_MEM_ERROR(
-      cm, cpi->select_mv_arr,
+      &cm->error, cpi->select_mv_arr,
       vpx_calloc(mi_rows * mi_cols * 4, sizeof(*cpi->select_mv_arr)));
 #endif
 
@@ -1280,18 +1408,18 @@ void vp9_init_tpl_buffer(VP9_COMP *cpi) {
     for (rf_idx = 0; rf_idx < MAX_INTER_REF_FRAMES; ++rf_idx) {
       vpx_free(cpi->tpl_stats[frame].mv_mode_arr[rf_idx]);
       CHECK_MEM_ERROR(
-          cm, cpi->tpl_stats[frame].mv_mode_arr[rf_idx],
+          &cm->error, cpi->tpl_stats[frame].mv_mode_arr[rf_idx],
           vpx_calloc(mi_rows * mi_cols * 4,
                      sizeof(*cpi->tpl_stats[frame].mv_mode_arr[rf_idx])));
       vpx_free(cpi->tpl_stats[frame].rd_diff_arr[rf_idx]);
       CHECK_MEM_ERROR(
-          cm, cpi->tpl_stats[frame].rd_diff_arr[rf_idx],
+          &cm->error, cpi->tpl_stats[frame].rd_diff_arr[rf_idx],
           vpx_calloc(mi_rows * mi_cols * 4,
                      sizeof(*cpi->tpl_stats[frame].rd_diff_arr[rf_idx])));
     }
 #endif
     vpx_free(cpi->tpl_stats[frame].tpl_stats_ptr);
-    CHECK_MEM_ERROR(cm, cpi->tpl_stats[frame].tpl_stats_ptr,
+    CHECK_MEM_ERROR(&cm->error, cpi->tpl_stats[frame].tpl_stats_ptr,
                     vpx_calloc(mi_rows * mi_cols,
                                sizeof(*cpi->tpl_stats[frame].tpl_stats_ptr)));
     cpi->tpl_stats[frame].is_valid = 0;
@@ -1325,6 +1453,7 @@ void vp9_free_tpl_buffer(VP9_COMP *cpi) {
     vpx_free(cpi->tpl_stats[frame].tpl_stats_ptr);
     cpi->tpl_stats[frame].is_valid = 0;
   }
+  free_tpl_frame_stats_list(&cpi->tpl_gop_stats);
 }
 
 #if CONFIG_RATE_CTRL
@@ -1369,22 +1498,94 @@ static void accumulate_frame_tpl_stats(VP9_COMP *cpi) {
 }
 #endif  // CONFIG_RATE_CTRL
 
+void vp9_estimate_tpl_qp_gop(VP9_COMP *cpi) {
+  int gop_length = cpi->twopass.gf_group.gf_group_size;
+  int bottom_index, top_index;
+  int idx;
+  const int gf_index = cpi->twopass.gf_group.index;
+  const int is_src_frame_alt_ref = cpi->rc.is_src_frame_alt_ref;
+  const int refresh_frame_context = cpi->common.refresh_frame_context;
+
+  for (idx = 1; idx <= gop_length; ++idx) {
+    TplDepFrame *tpl_frame = &cpi->tpl_stats[idx];
+    int target_rate = cpi->twopass.gf_group.bit_allocation[idx];
+    cpi->twopass.gf_group.index = idx;
+    vp9_rc_set_frame_target(cpi, target_rate);
+    vp9_configure_buffer_updates(cpi, idx);
+    if (cpi->tpl_with_external_rc) {
+      VP9_COMMON *cm = &cpi->common;
+      if (cpi->ext_ratectrl.ready &&
+          (cpi->ext_ratectrl.funcs.rc_type & VPX_RC_QP) != 0 &&
+          cpi->ext_ratectrl.funcs.get_encodeframe_decision != NULL) {
+        vpx_codec_err_t codec_status;
+        const GF_GROUP *gf_group = &cpi->twopass.gf_group;
+        vpx_rc_encodeframe_decision_t encode_frame_decision;
+        codec_status = vp9_extrc_get_encodeframe_decision(
+            &cpi->ext_ratectrl, gf_group->index - 1, &encode_frame_decision);
+        if (codec_status != VPX_CODEC_OK) {
+          vpx_internal_error(&cm->error, codec_status,
+                             "vp9_extrc_get_encodeframe_decision() failed");
+        }
+        tpl_frame->base_qindex = encode_frame_decision.q_index;
+      } else {
+        vpx_internal_error(&cm->error, VPX_CODEC_INVALID_PARAM,
+                           "The external rate control library is not set "
+                           "properly for TPL pass.");
+      }
+    } else {
+      tpl_frame->base_qindex = vp9_rc_pick_q_and_bounds_two_pass(
+          cpi, &bottom_index, &top_index, idx);
+      tpl_frame->base_qindex = VPXMAX(tpl_frame->base_qindex, 1);
+    }
+  }
+  // Reset the actual index and frame update
+  cpi->twopass.gf_group.index = gf_index;
+  cpi->rc.is_src_frame_alt_ref = is_src_frame_alt_ref;
+  cpi->common.refresh_frame_context = refresh_frame_context;
+  vp9_configure_buffer_updates(cpi, gf_index);
+}
+
 void vp9_setup_tpl_stats(VP9_COMP *cpi) {
   GF_PICTURE gf_picture[MAX_ARF_GOP_SIZE];
   const GF_GROUP *gf_group = &cpi->twopass.gf_group;
   int tpl_group_frames = 0;
   int frame_idx;
+  int extended_frame_count;
   cpi->tpl_bsize = BLOCK_32X32;
 
-  init_gop_frames(cpi, gf_picture, gf_group, &tpl_group_frames);
+  extended_frame_count =
+      init_gop_frames(cpi, gf_picture, gf_group, &tpl_group_frames);
 
   init_tpl_stats(cpi);
+
+  init_tpl_stats_before_propagation(&cpi->common.error, &cpi->tpl_gop_stats,
+                                    cpi->tpl_stats, tpl_group_frames,
+                                    cpi->common.width, cpi->common.height);
 
   // Backward propagation from tpl_group_frames to 1.
   for (frame_idx = tpl_group_frames - 1; frame_idx > 0; --frame_idx) {
     if (gf_picture[frame_idx].update_type == USE_BUF_FRAME) continue;
     mc_flow_dispenser(cpi, gf_picture, frame_idx, cpi->tpl_bsize);
   }
+
+  if (cpi->ext_ratectrl.ready &&
+      cpi->ext_ratectrl.funcs.send_tpl_gop_stats != NULL) {
+    // Intra search on key frame
+    if (gf_picture[0].update_type == KF_UPDATE) {
+      mc_flow_dispenser(cpi, gf_picture, 0, cpi->tpl_bsize);
+    }
+    // TPL stats has extra frames from next GOP. Trim those extra frames for
+    // Qmode.
+    trim_tpl_stats(&cpi->common.error, &cpi->tpl_gop_stats,
+                   extended_frame_count);
+    const vpx_codec_err_t codec_status =
+        vp9_extrc_send_tpl_stats(&cpi->ext_ratectrl, &cpi->tpl_gop_stats);
+    if (codec_status != VPX_CODEC_OK) {
+      vpx_internal_error(&cpi->common.error, codec_status,
+                         "vp9_extrc_send_tpl_stats() failed");
+    }
+  }
+
 #if CONFIG_NON_GREEDY_MV
   cpi->tpl_ready = 1;
 #if DUMP_TPL_STATS
