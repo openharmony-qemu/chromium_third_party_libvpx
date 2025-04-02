@@ -178,6 +178,7 @@ INSTALL-LIBS-yes += include/vpx/vpx_image.h
 INSTALL-LIBS-yes += include/vpx/vpx_integer.h
 INSTALL-LIBS-$(CONFIG_DECODERS) += include/vpx/vpx_decoder.h
 INSTALL-LIBS-$(CONFIG_ENCODERS) += include/vpx/vpx_encoder.h
+INSTALL-LIBS-$(CONFIG_ENCODERS) += include/vpx/vpx_tpl.h
 ifeq ($(CONFIG_EXTERNAL_BUILD),yes)
 ifeq ($(CONFIG_MSVS),yes)
 INSTALL-LIBS-yes                  += $(foreach p,$(VS_PLATFORMS),$(LIBSUBDIR)/$(p)/$(CODEC_LIB).lib)
@@ -212,6 +213,11 @@ libvpx_srcs.txt:
 	@echo "    [CREATE] $@"
 	@echo $(CODEC_SRCS) | xargs -n1 echo | LC_ALL=C sort -u > $@
 CLEAN-OBJS += libvpx_srcs.txt
+
+libvpxrc_srcs.txt:
+	@echo "    [CREATE] $@"
+	@echo $(RC_RTC_SRCS) | xargs -n1 echo | LC_ALL=C sort -u > $@
+CLEAN-OBJS += libvpxrc_srcs.txt
 
 # Assembly files that are included, but don't define symbols themselves.
 # Filtered out to avoid Windows build warnings.
@@ -312,9 +318,9 @@ $(BUILD_PFX)libvpx_g.a: $(LIBVPX_OBJS)
 # To determine SO_VERSION_{MAJOR,MINOR,PATCH}, calculate c,a,r with current
 # SO_VERSION_* then follow the rules in the link to detemine the new version
 # (c1, a1, r1) and set MAJOR to [c1-a1], MINOR to a1 and PATCH to r1
-SO_VERSION_MAJOR := 8
+SO_VERSION_MAJOR := 9
 SO_VERSION_MINOR := 0
-SO_VERSION_PATCH := 0
+SO_VERSION_PATCH := 1
 ifeq ($(filter darwin%,$(TGT_OS)),$(TGT_OS))
 LIBVPX_SO               := libvpx.$(SO_VERSION_MAJOR).dylib
 SHARED_LIB_SUF          := .dylib
@@ -545,7 +551,7 @@ testdata: $(LIBVPX_TEST_DATA)
             echo "Checking test data:";\
             for f in $(call enabled,LIBVPX_TEST_DATA); do\
                 grep $$f $(SRC_PATH_BARE)/test/test-data.sha1 |\
-                    (cd $(LIBVPX_TEST_DATA_PATH); $${sha1sum} -c);\
+                    (cd "$(LIBVPX_TEST_DATA_PATH)"; $${sha1sum} -c);\
             done; \
         else\
             echo "Skipping test data integrity check, sha1sum not found.";\
@@ -764,10 +770,10 @@ TEST_BIN_PATH := $(addsuffix /$(TGT_OS:win64=x64)/Release, $(TEST_BIN_PATH))
 endif
 utiltest utiltest-no-data-check:
 	$(qexec)$(SRC_PATH_BARE)/test/vpxdec.sh \
-		--test-data-path $(LIBVPX_TEST_DATA_PATH) \
+		--test-data-path "$(LIBVPX_TEST_DATA_PATH)" \
 		--bin-path $(TEST_BIN_PATH)
 	$(qexec)$(SRC_PATH_BARE)/test/vpxenc.sh \
-		--test-data-path $(LIBVPX_TEST_DATA_PATH) \
+		--test-data-path "$(LIBVPX_TEST_DATA_PATH)" \
 		--bin-path $(TEST_BIN_PATH)
 utiltest: testdata
 else
@@ -791,7 +797,7 @@ EXAMPLES_BIN_PATH := $(TGT_OS:win64=x64)/Release
 endif
 exampletest exampletest-no-data-check: examples
 	$(qexec)$(SRC_PATH_BARE)/test/examples.sh \
-		--test-data-path $(LIBVPX_TEST_DATA_PATH) \
+		--test-data-path "$(LIBVPX_TEST_DATA_PATH)" \
 		--bin-path $(EXAMPLES_BIN_PATH)
 exampletest: testdata
 else
