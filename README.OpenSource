@@ -1,0 +1,11 @@
+[
+    {
+        "Name": "libvpx",
+        "License": "BSD-3-Clause",
+        "License File": "LICENSE",
+        "Version Number": "727319a77ffe68e9aacb08e09ae7151b3a8f70a3",
+        "Owner": "huamengzheng@huawei.com",
+        "Upstream URL": "https://chromium.googlesource.com/webm/libvpx.git@727319a77ffe68e9aacb08e09ae7151b3a8f70a3",
+        "Description": "libvpx包"
+    }
+]
