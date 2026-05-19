@@ -681,6 +681,16 @@ enum vp8e_enc_control_id {
    */
   VP9E_SET_KEY_FRAME_FILTERING,
 
+  /*!\brief Codec control function to validate HBD input.
+   *
+   * VP9 allows the encoder to validate the high bitdepth (HBD) input and
+   * ensure that every pixel is within the valid range. To disable/enable,
+   * set this parameter to 0/1. The default value is set to be 1.
+   *
+   * Supported in codecs: VP9
+   */
+  VP9E_SET_VALIDATE_INPUT_HBD,
+
   /*!\brief Codec control function to enable postencode frame drop.
    *
    * This will allow encoder to drop frame after it's encoded.
@@ -1088,6 +1098,8 @@ VPX_CTRL_USE_TYPE(VP9E_SET_TPL, int)
 #define VPX_CTRL_VP9E_SET_TPL
 VPX_CTRL_USE_TYPE(VP9E_SET_KEY_FRAME_FILTERING, int)
 #define VPX_CTRL_VP9E_SET_KEY_FRAME_FILTERING
+VPX_CTRL_USE_TYPE(VP9E_SET_VALIDATE_INPUT_HBD, int)
+#define VPX_CTRL_VP9E_SET_VALIDATE_INPUT_HBD
 VPX_CTRL_USE_TYPE(VP9E_SET_POSTENCODE_DROP, unsigned int)
 #define VPX_CTRL_VP9E_SET_POSTENCODE_DROP
 VPX_CTRL_USE_TYPE(VP9E_SET_DELTA_Q_UV, int)
